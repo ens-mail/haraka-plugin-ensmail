@@ -1,0 +1,12 @@
+{
+  "name": "haraka-plugin-ensmail",
+  "version": "1.0.0",
+  "description": "A haraka plugin that implement ENS MX Protocol.",
+  "main": "index.js",
+  "repository": "git@github.com:ens-mail/haraka-plugin-ensmail.git",
+  "author": "flyinglimao <hi@limaois.me>",
+  "license": "MIT",
+  "dependencies": {
+    "ethers": "^6.7.0"
+  }
+}
