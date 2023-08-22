@@ -7,6 +7,7 @@
   "author": "flyinglimao <hi@limaois.me>",
   "license": "MIT",
   "dependencies": {
+    "address-rfc2821": "^2.0.1",
     "ethers": "^6.7.0"
   }
 }
