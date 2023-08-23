@@ -1,14 +1,16 @@
 "use strict";
 
 const path = require("path");
-const { JsonRpcProvider, EnsResolver, EnsPlugin } = require("ethers");
+const { JsonRpcProvider, EnsResolver, verifyMessage } = require("ethers");
 const { NoDestError } = require("./error");
 const { Address } = require("address-rfc2821");
+const utils = require("haraka-utils");
 
 let outbound;
 let provider;
 
 exports.register = function () {
+  this.inherits("auth/auth_base");
   this.load_ensmail_ini();
   this.load_host_list();
   outbound = this.haraka_require("outbound");
@@ -20,12 +22,7 @@ exports.load_ensmail_ini = async function () {
   });
 
   if (!this.cfg.main.rpc_url) throw new Error("rpc url not given");
-  provider = new JsonRpcProvider(this.cfg.main.rpc_url, {
-    chainId: 11155111,
-    ensAddress: "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
-    ensNetwork: 11155111,
-    name: "sepolia",
-  });
+  provider = new JsonRpcProvider(this.cfg.main.rpc_url);
 
   this.mode = this.cfg.main.mode === "RECEIVE" ? "RECEIVE" : "FORWARD";
 
@@ -53,7 +50,31 @@ exports.load_host_list = function () {
   this.host_list = lowered_list;
 };
 
+exports.hook_capabilities = function (next, connection) {
+  // don't allow AUTH unless private IP or encrypted
+  if (!connection.remote.is_private && !connection.tls.enabled) {
+    connection.logdebug(this, "Auth disabled for insecure public connection");
+    return next();
+  }
+
+  connection.capabilities.push(`AUTH PLAIN`);
+  connection.notes.allowed_auth_methods = ["PLAIN"];
+
+  next();
+};
+
 exports.hook_mail = async function (next, connection, params) {
+  const sender = params[0];
+  // is sender's host is this server, then it's outbound
+  connection.transaction.notes.isOutbound = this.host_list[sender.host];
+
+  if (
+    connection.transaction.notes.isOutbound &&
+    sender.user !== connection.notes.auth_user
+  ) {
+    return next(DENY, "not authenticated");
+  }
+
   // TODO: maybe need some checks here
   next();
 };
@@ -61,6 +82,44 @@ exports.hook_mail = async function (next, connection, params) {
 exports.hook_rcpt = async function (next, connection, params) {
   const txn = connection.transaction;
   if (!txn) return next();
+
+  if (txn.notes.isOutbound) {
+    return this.handle_send(next, connection, params);
+  } else {
+    return this.handle_forward(next, connection, params);
+  }
+};
+
+exports.hook_data_post = function (next, connection) {
+  const transaction = connection.transaction;
+
+  if (!transaction.notes.isOutbound) {
+    // rewrite sender
+    /// make original sender be the reply-to
+    this.loginfo(transaction.header.headers["from"]);
+    transaction.add_header("Reply-to", transaction.header.headers["from"][0]);
+    transaction.remove_header("From");
+    transaction.add_header(
+      "From",
+      `Forwarder <${this.cfg.main.forwarder_address}>`
+    );
+    /// make sender be me
+    transaction.mail_from = new Address(`<${this.cfg.main.forwarder_address}>`);
+  }
+
+  next();
+};
+
+exports.handle_send = async function (next, connection, params) {
+  // TODO: Early rewrite if rcpt is also ens mail
+  // for now, we skip rewrite and treat it as normal mail
+
+  connection.relaying = true;
+  next();
+};
+
+exports.handle_forward = async function (next, connection, params) {
+  const transaction = connection.transaction;
 
   // TODO: should check if sender is friendly
   // for now, we assume senders are not spammer
@@ -71,8 +130,8 @@ exports.hook_rcpt = async function (next, connection, params) {
     return next(DENY, `Not resolving because ${host} is not in host_list`);
   }
 
+  // enable relaying to make it outbound
   connection.relaying = true;
-  const transaction = connection.transaction;
 
   // rewrite recipient
   const dest = await this.lookup_ens_dest(address);
@@ -80,22 +139,6 @@ exports.hook_rcpt = async function (next, connection, params) {
   transaction.rcpt_to.pop();
   transaction.rcpt_to.push(new Address(`<${dest}>`));
 
-  next();
-};
-
-exports.hook_data_post = function (next, connection) {
-  const transaction = connection.transaction;
-  // rewrite sender
-  /// make original sender be the reply-to
-  this.loginfo(transaction.header.headers["from"]);
-  transaction.add_header("Reply-to", transaction.header.headers["from"][0]);
-  transaction.remove_header("From");
-  transaction.add_header(
-    "From",
-    `Forwarder <${this.cfg.main.forwarder_address}>`
-  );
-  /// make sender be me
-  transaction.mail_from = new Address(`<${this.cfg.main.forwarder_address}>`);
   next();
 };
 
@@ -118,4 +161,79 @@ exports.lookup_ens_dest = async function (mailAddress, depth = 0) {
   if (email) return email;
 
   throw new NoDestError("no destination found");
+};
+
+exports.auth_plain = async function (next, connection, params) {
+  // one parameter given on line, either:
+  //    AUTH PLAIN <param> or
+  //    AUTH PLAIN\n
+  //...
+  //    <param>
+  if (params[0]) {
+    const credentials = utils.unbase64(params[0]).split(/\0/);
+    credentials.shift(); // Discard authid
+
+    const [user, password] = credentials;
+    let valid;
+    try {
+      const ens = await EnsResolver.fromName(provider, user + ".eth");
+      const owner = await ens.getAddress();
+      const verify = verifyMessage(
+        `${this.cfg.main.sign_in_challenge}: ${user}`,
+        password
+      );
+      valid = verify && verify === owner;
+    } catch (err) {
+      valid = false;
+    }
+
+    const statusCode = valid ? 235 : 535;
+    const statusMessage = valid
+      ? "2.7.0 Authentication successful"
+      : "5.7.8 Authentication failed";
+
+    if (valid) {
+      connection.relaying = true;
+
+      connection.respond(statusCode, statusMessage, () => {
+        connection.authheader = "(authenticated bits=0)\n";
+        connection.auth_results(`auth=pass (PLAIN)`);
+        connection.notes.auth_user = credentials[0];
+        return next(OK);
+      });
+      return;
+    }
+
+    if (!connection.notes.auth_fails) connection.notes.auth_fails = 0;
+
+    connection.notes.auth_fails++;
+    connection.results.add(
+      { name: "auth" },
+      {
+        fail: `${this.name}/PLAIN`,
+      }
+    );
+
+    let delay = Math.pow(2, connection.notes.auth_fails - 1);
+    if (this.timeout && delay >= this.timeout) {
+      delay = this.timeout - 1;
+    }
+    connection.lognotice(this, `delaying for ${delay} seconds`);
+    // here we include the username, as shown in RFC 5451 example
+    connection.auth_results(`auth=fail (PLAIN) smtp.auth=${credentials[0]}`);
+    setTimeout(() => {
+      connection.respond(statusCode, statusMessage, () => {
+        connection.reset_transaction(() => next(OK));
+      });
+    }, delay * 1000);
+  }
+
+  if (connection.notes.auth_plain_asked_login) {
+    return next(DENYDISCONNECT, "bad protocol");
+  }
+
+  connection.respond(334, " ", () => {
+    connection.notes.auth_plain_asked_login = true;
+    next(OK);
+  });
 };
